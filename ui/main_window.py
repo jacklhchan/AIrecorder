@@ -11,7 +11,7 @@ from PyQt6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QComboBox, QLabel, QFileDialog,
     QFrame, QMessageBox, QSizePolicy, QCheckBox, QApplication,
-    QSystemTrayIcon, QMenu
+    QSystemTrayIcon, QMenu, QSlider
 )
 
 import subprocess
@@ -25,6 +25,8 @@ from video_engine import VideoEngine
 from ui.level_meter import LevelMeterWidget
 from ui.silence_indicator import SilenceIndicator
 from ui.overlay import OverlayWidget
+from ui.toast import ToastManager
+from ui.recording_history import RecordingHistoryWidget
 
 
 class SignalBridge(QObject):
@@ -58,9 +60,15 @@ class MainWindow(QMainWindow):
         self.audio_engine.set_silence_callback(self._on_silence_update)
         self.audio_engine.set_error_callback(self._on_error)
         
+        # Toast manager
+        self.toast = ToastManager()
+        
         # Recording state
         self.output_directory = os.path.expanduser("~/Music/BlackHole Recordings")
         self._recording_start_time: Optional[datetime] = None
+        self._is_paused = False
+        self._pause_start_time: Optional[datetime] = None
+        self._total_paused_seconds = 0.0
         
         # Hotkey Manager
         self.hotkey_manager = HotkeyManager()
@@ -71,8 +79,6 @@ class MainWindow(QMainWindow):
             print(f"Failed to start hotkey listener (Input Monitoring permission?): {e}")
         
         # System Tray
-        self.docks_icon_idle = "⚫" # Simple text icon for now, or use system icon
-        self.docks_icon_rec = "🔴"
         self._setup_system_tray()
         
         # Set up UI
@@ -84,19 +90,19 @@ class MainWindow(QMainWindow):
         # Overlay Widget
         self.overlay = OverlayWidget()
         self.overlay.stop_clicked.connect(self.stop_recording)
+        self.overlay.pause_clicked.connect(self.toggle_pause)
+        self.overlay.mic_toggled.connect(self._on_overlay_mic_toggled)
         
         # Timer for recording duration update
         self.duration_timer = QTimer(self)
         self.duration_timer.timeout.connect(self.update_duration_display)
         
+        # Load recording history
+        self.history_widget.scan_directory(self.output_directory)
+        
     def _setup_system_tray(self) -> None:
         """Initialize the system tray icon."""
         self.tray_icon = QSystemTrayIcon(self)
-        
-        # Use a standard icon (QIcon/Theme) or a simple pixmap
-        # For simplicity, we'll try to use a system standard icon if available, or just a placeholder.
-        # On macOS, QSystemTrayIcon might need a proper .png.
-        # Let's create a simple generated pixmap for the dot.
         self._set_tray_icon_color("black")
         
         self.tray_menu = QMenu()
@@ -136,10 +142,9 @@ class MainWindow(QMainWindow):
         if color == "red":
              painter.setBrush(QColor("#e11d48"))
         else:
-             painter.setBrush(QColor("#000000")) # Dark for menu bar
+             painter.setBrush(QColor("#000000"))
              
         painter.setPen(Qt.PenStyle.NoPen)
-        # Draw circle centered
         painter.drawEllipse(4, 4, 14, 14)
         painter.end()
         
@@ -149,15 +154,16 @@ class MainWindow(QMainWindow):
         """Toggle recording state (Start/Stop)."""
         if self.audio_engine.state == RecordingState.RECORDING:
             self.stop_recording()
+        elif self.audio_engine.state == RecordingState.PAUSED:
+            self.stop_recording()
         else:
             self.start_recording()
             
     def setup_ui(self) -> None:
         """Set up the user interface."""
         self.setWindowTitle("BlackHole Audio Recorder")
-        self.setWindowTitle("BlackHole Audio Recorder")
-        self.setMinimumSize(600, 750)
-        self.resize(650, 850)
+        self.setMinimumSize(600, 850)
+        self.resize(650, 950)
         
         # Central widget
         central_widget = QWidget()
@@ -194,7 +200,6 @@ class MainWindow(QMainWindow):
         sources_layout.setContentsMargins(16, 16, 16, 20)
         sources_layout.setSpacing(16)
         
-        # Section Title
         sources_title = QLabel("AUDIO SOURCES")
         sources_title.setObjectName("sectionTitle")
         sources_layout.addWidget(sources_title)
@@ -219,10 +224,9 @@ class MainWindow(QMainWindow):
         input_row.addLayout(device_row)
         sources_layout.addLayout(input_row)
         
-        # Separator line
+        # Separator
         line = QFrame()
         line.setFrameShape(QFrame.Shape.HLine)
-        line.setFrameShadow(QFrame.Shadow.Sunken)
         line.setStyleSheet("background-color: #1e293b; border: none; height: 1px;")
         sources_layout.addWidget(line)
         
@@ -233,6 +237,7 @@ class MainWindow(QMainWindow):
         mic_header = QHBoxLayout()
         self.mic_check = QCheckBox("Enable Microphone Overlay")
         self.mic_check.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.mic_check.setToolTip("Mix microphone audio into the recording")
         mic_header.addWidget(self.mic_check)
         mic_header.addStretch()
         mic_row.addLayout(mic_header)
@@ -241,6 +246,87 @@ class MainWindow(QMainWindow):
         self.mic_combo.setEnabled(False)
         self.mic_combo.setPlaceholderText("Select Microphone...")
         mic_row.addWidget(self.mic_combo)
+        
+        # Mic Volume Slider
+        mic_vol_row = QHBoxLayout()
+        mic_vol_row.setSpacing(8)
+        mic_vol_label = QLabel("Mic Volume")
+        mic_vol_label.setStyleSheet("color: #94a3b8; font-size: 11px;")
+        mic_vol_row.addWidget(mic_vol_label)
+        
+        self.mic_volume_slider = QSlider(Qt.Orientation.Horizontal)
+        self.mic_volume_slider.setRange(0, 200)
+        self.mic_volume_slider.setValue(100)
+        self.mic_volume_slider.setToolTip("Mic volume: 100%")
+        self.mic_volume_slider.setStyleSheet("""
+            QSlider::groove:horizontal {
+                background: #1e293b; height: 6px; border-radius: 3px;
+            }
+            QSlider::handle:horizontal {
+                background: #3b82f6; width: 16px; height: 16px;
+                margin: -5px 0; border-radius: 8px;
+            }
+            QSlider::sub-page:horizontal {
+                background: #3b82f6; border-radius: 3px;
+            }
+        """)
+        mic_vol_row.addWidget(self.mic_volume_slider, 1)
+        
+        self.mic_vol_value = QLabel("100%")
+        self.mic_vol_value.setFixedWidth(40)
+        self.mic_vol_value.setStyleSheet("color: #94a3b8; font-size: 11px;")
+        mic_vol_row.addWidget(self.mic_vol_value)
+        mic_row.addLayout(mic_vol_row)
+        
+        # Separator
+        line2 = QFrame()
+        line2.setFrameShape(QFrame.Shape.HLine)
+        line2.setStyleSheet("background-color: #1e293b; border: none; height: 1px;")
+        mic_row.addWidget(line2)
+        
+        # Noise Gate Controls
+        gate_header = QHBoxLayout()
+        self.noise_gate_check = QCheckBox("Noise Gate")
+        self.noise_gate_check.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.noise_gate_check.setToolTip("Suppress mic background noise below threshold")
+        gate_header.addWidget(self.noise_gate_check)
+        
+        self.gate_status_label = QLabel("○ OFF")
+        self.gate_status_label.setStyleSheet("color: #64748b; font-size: 11px;")
+        gate_header.addStretch()
+        gate_header.addWidget(self.gate_status_label)
+        mic_row.addLayout(gate_header)
+        
+        gate_threshold_row = QHBoxLayout()
+        gate_threshold_row.setSpacing(8)
+        gate_thresh_label = QLabel("Threshold")
+        gate_thresh_label.setStyleSheet("color: #94a3b8; font-size: 11px;")
+        gate_threshold_row.addWidget(gate_thresh_label)
+        
+        self.gate_threshold_slider = QSlider(Qt.Orientation.Horizontal)
+        self.gate_threshold_slider.setRange(-60, -10)
+        self.gate_threshold_slider.setValue(-40)
+        self.gate_threshold_slider.setToolTip("Noise gate threshold: -40 dB")
+        self.gate_threshold_slider.setEnabled(False)
+        self.gate_threshold_slider.setStyleSheet("""
+            QSlider::groove:horizontal {
+                background: #1e293b; height: 6px; border-radius: 3px;
+            }
+            QSlider::handle:horizontal {
+                background: #f59e0b; width: 16px; height: 16px;
+                margin: -5px 0; border-radius: 8px;
+            }
+            QSlider::sub-page:horizontal {
+                background: #f59e0b; border-radius: 3px;
+            }
+        """)
+        gate_threshold_row.addWidget(self.gate_threshold_slider, 1)
+        
+        self.gate_thresh_value = QLabel("-40 dB")
+        self.gate_thresh_value.setFixedWidth(48)
+        self.gate_thresh_value.setStyleSheet("color: #94a3b8; font-size: 11px;")
+        gate_threshold_row.addWidget(self.gate_thresh_value)
+        mic_row.addLayout(gate_threshold_row)
         
         sources_layout.addLayout(mic_row)
         layout.addWidget(sources_frame)
@@ -259,12 +345,10 @@ class MainWindow(QMainWindow):
         meters_layout = QVBoxLayout()
         meters_layout.setSpacing(12)
         
-        # System Level
         self.sys_level_meter = LevelMeterWidget()
         self.sys_level_meter.label.setText("System Audio")
         meters_layout.addWidget(self.sys_level_meter)
         
-        # Mic Level
         self.mic_level_meter = LevelMeterWidget()
         self.mic_level_meter.label.setText("Microphone")
         meters_layout.addWidget(self.mic_level_meter)
@@ -288,28 +372,27 @@ class MainWindow(QMainWindow):
         monitor_layout.addWidget(indicators_frame)
         layout.addWidget(monitor_frame)
         
-        # === Controls Section (Floating Bottom) ===
+        # === Controls Section ===
         controls_frame = QFrame()
         controls_frame.setObjectName("controlsFrame")
         controls_layout = QVBoxLayout(controls_frame)
         controls_layout.setContentsMargins(16, 16, 16, 16)
         controls_layout.setSpacing(16)
         
-        # Top row: Screen Record Switch + Output
+        # Top row: Screen Record + Output
         options_row = QHBoxLayout()
         
         self.screen_record_check = QCheckBox("Capture Screen Video")
         self.screen_record_check.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.screen_record_check.setToolTip("Record screen video alongside audio")
         options_row.addWidget(self.screen_record_check)
         
         self.screen_combo = QComboBox()
         self.screen_combo.setMinimumWidth(150)
-        # Always enabled so user can see what's available
         options_row.addWidget(self.screen_combo)
         
         options_row.addStretch()
         
-        # Output directory mini-button
         self.change_output_btn = QPushButton("Save to: Music/...")
         self.change_output_btn.setObjectName("ghostBtn")
         self.change_output_btn.setToolTip(self.output_directory)
@@ -321,14 +404,13 @@ class MainWindow(QMainWindow):
         # Timer Display
         time_container = QWidget()
         time_layout = QHBoxLayout(time_container)
-        time_layout.setContentsMargins(0,0,0,0)
+        time_layout.setContentsMargins(0, 0, 0, 0)
         
         self.duration_label = QLabel("00:00:00")
-        self.duration_label.setFont(QFont("Monaco", 28, QFont.Weight.Bold)) # Monospaced
+        self.duration_label.setFont(QFont("Monaco", 28, QFont.Weight.Bold))
         self.duration_label.setStyleSheet("color: #f8fafc;")
         self.duration_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         
-        # Add red dot indicator
         self.rec_dot = QLabel("●")
         self.rec_dot.setStyleSheet("color: #e11d48; font-size: 24px;")
         self.rec_dot.setVisible(False)
@@ -340,7 +422,7 @@ class MainWindow(QMainWindow):
         
         controls_layout.addWidget(time_container)
         
-        # Main Buttons
+        # Main Buttons: Record | Pause | Stop
         btn_layout = QHBoxLayout()
         btn_layout.setSpacing(12)
         
@@ -349,6 +431,14 @@ class MainWindow(QMainWindow):
         self.record_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self.record_btn.setMinimumHeight(48)
         btn_layout.addWidget(self.record_btn)
+        
+        self.pause_btn = QPushButton("⏸ Pause")
+        self.pause_btn.setObjectName("pauseBtn")
+        self.pause_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.pause_btn.setMinimumHeight(48)
+        self.pause_btn.setEnabled(False)
+        self.pause_btn.setVisible(False)
+        btn_layout.addWidget(self.pause_btn)
         
         self.stop_btn = QPushButton("Stop")
         self.stop_btn.setObjectName("stopBtn")
@@ -367,8 +457,20 @@ class MainWindow(QMainWindow):
         
         layout.addWidget(controls_frame)
         
-        # Keep references for path updates (hidden label logic removed, using button tooltip/text)
-        self.output_label = QLabel() # Dummy to prevent attribute error if accessed elsewhere
+        # === Recording History Section ===
+        history_frame = QFrame()
+        history_frame.setObjectName("cardFrame")
+        history_frame.setMaximumHeight(250)
+        history_layout = QVBoxLayout(history_frame)
+        history_layout.setContentsMargins(16, 16, 16, 16)
+        
+        self.history_widget = RecordingHistoryWidget()
+        history_layout.addWidget(self.history_widget)
+        
+        layout.addWidget(history_frame)
+        
+        # Dummy label for backward compat
+        self.output_label = QLabel()
         
         # Connect signal bridge
         self.signal_bridge.level_changed.connect(self._update_levels)
@@ -379,33 +481,64 @@ class MainWindow(QMainWindow):
         """Set up signal-slot connections."""
         self.record_btn.clicked.connect(self.start_recording)
         self.stop_btn.clicked.connect(self.stop_recording)
-        self.refresh_btn.clicked.connect(self.load_devices)
+        self.pause_btn.clicked.connect(self.toggle_pause)
         self.refresh_btn.clicked.connect(self.load_devices)
         self.refresh_btn.clicked.connect(self.load_screens)
         self.change_output_btn.clicked.connect(self.change_output_directory)
         self.mic_check.toggled.connect(self._toggle_mic_selection)
         self.screen_record_check.toggled.connect(self._toggle_screen_selection)
+        self.mic_volume_slider.valueChanged.connect(self._on_mic_volume_changed)
+        self.noise_gate_check.toggled.connect(self._on_noise_gate_toggled)
+        self.gate_threshold_slider.valueChanged.connect(self._on_gate_threshold_changed)
         
     def _toggle_mic_selection(self, checked: bool) -> None:
         """Enable/disable mic selection and dynamically toggle during recording."""
-        # If currently recording, dynamically enable/disable the mic stream
-        if self.audio_engine.state == RecordingState.RECORDING:
+        if self.audio_engine.state in (RecordingState.RECORDING, RecordingState.PAUSED):
             if checked and self.mic_combo.currentData():
                 mic_device: AudioDevice = self.mic_combo.currentData()
                 self.audio_engine.enable_mic(mic_device.index)
+                self.toast.info("Microphone enabled")
             else:
                 self.audio_engine.disable_mic()
-            # Keep mic_combo disabled during recording to prevent device switching
+                self.toast.info("Microphone disabled")
+            # Sync overlay
+            self.overlay.set_mic_active(checked)
             self.mic_combo.setEnabled(False)
         else:
             self.mic_combo.setEnabled(checked)
         
     def _toggle_screen_selection(self, checked: bool) -> None:
         """Enable/disable screen selection dropdown."""
-        # User requested to see it always. We keep it enabled.
-        # Alternatively, we could enable it only when checked, but the request was "why only show up when checked?"
-        # The previous code disabled it. Now we do nothing or ensure it's enabled.
         self.screen_combo.setEnabled(True)
+    
+    def _on_mic_volume_changed(self, value: int) -> None:
+        """Handle mic volume slider change."""
+        gain = value / 100.0
+        self.audio_engine.mic_gain = gain
+        self.mic_vol_value.setText(f"{value}%")
+        self.mic_volume_slider.setToolTip(f"Mic volume: {value}%")
+    
+    def _on_noise_gate_toggled(self, checked: bool) -> None:
+        """Handle noise gate toggle."""
+        self.audio_engine.noise_gate_enabled = checked
+        self.gate_threshold_slider.setEnabled(checked)
+        if checked:
+            self.gate_status_label.setText("● ACTIVE")
+            self.gate_status_label.setStyleSheet("color: #22c55e; font-size: 11px;")
+            self.toast.info("Noise gate enabled")
+        else:
+            self.gate_status_label.setText("○ OFF")
+            self.gate_status_label.setStyleSheet("color: #64748b; font-size: 11px;")
+    
+    def _on_gate_threshold_changed(self, value: int) -> None:
+        """Handle noise gate threshold slider change."""
+        self.audio_engine.noise_gate_threshold = float(value)
+        self.gate_thresh_value.setText(f"{value} dB")
+        self.gate_threshold_slider.setToolTip(f"Noise gate threshold: {value} dB")
+    
+    def _on_overlay_mic_toggled(self, active: bool) -> None:
+        """Handle mic toggle from overlay — sync with main window checkbox."""
+        self.mic_check.setChecked(active)
     
     def load_screens(self) -> None:
         """Load available screens/monitors."""
@@ -429,18 +562,14 @@ class MainWindow(QMainWindow):
         blackhole_index = -1
         
         for i, device in enumerate(devices):
-            # Add to main device list
             display_name = device.name
             if device.is_blackhole:
                 display_name = f"✓ {device.name} (Recommended)"
                 blackhole_index = i
             
             self.device_combo.addItem(display_name, device)
-            
-            # Add to mic list (exclude BlackHole from recommended visual, but keep available)
             self.mic_combo.addItem(device.name, device)
         
-        # Auto-select BlackHole if found
         if blackhole_index >= 0:
             self.device_combo.setCurrentIndex(blackhole_index)
             self.status_label.setText("BlackHole device detected — Ready to record")
@@ -450,7 +579,6 @@ class MainWindow(QMainWindow):
             self.status_label.setStyleSheet("color: #ff4444; font-size: 13px;")
             self.record_btn.setEnabled(False)
             
-        # Select built-in mic for secondary if possible (simple heuristic)
         for i in range(self.mic_combo.count()):
             dev = self.mic_combo.itemData(i)
             if "microphone" in dev.name.lower():
@@ -466,51 +594,44 @@ class MainWindow(QMainWindow):
         if not device:
             return
         
-        # Ensure output directory exists
         os.makedirs(self.output_directory, exist_ok=True)
         
-        # Determine secondary device
         mic_index = None
         if self.mic_check.isChecked() and self.mic_combo.currentData():
             mic_device: AudioDevice = self.mic_combo.currentData()
             mic_index = mic_device.index
         
-        # Check Video Requirements
+        # Check Video
         self.is_recording_video = self.screen_record_check.isChecked()
         if self.is_recording_video:
-            # Check for ffmpeg
             try:
                 subprocess.run(['ffmpeg', '-version'], capture_output=True, check=True)
             except (subprocess.CalledProcessError, FileNotFoundError):
-                 QMessageBox.critical(
+                QMessageBox.critical(
                     self, "FFmpeg Missing",
-                    "Screen recording requires FFmpeg to merge audio and video.\n"
-                    "Please install it via Homebrew: brew install ffmpeg"
+                    "Screen recording requires FFmpeg.\nInstall: brew install ffmpeg"
                 )
-                 return
+                return
             
-            # Start Video
-            screen_index = 0
-            if self.screen_combo.currentData() is not None:
-                screen_index = self.screen_combo.currentData()
-                
+            screen_index = self.screen_combo.currentData() or 0
             if not self.video_engine.start_recording(self.output_directory, monitor_index=screen_index):
-                 QMessageBox.warning(self, "Error", "Failed to start screen recording.")
-                 return
+                self.toast.error("Failed to start screen recording")
+                return
         
-        # Start recording
         success = self.audio_engine.start_recording(device.index, self.output_directory, mic_device_index=mic_index)
         
         if success:
             self._recording_start_time = datetime.now()
-            self.duration_timer.start(100)  # Update every 100ms
+            self._is_paused = False
+            self._total_paused_seconds = 0.0
+            self.duration_timer.start(100)
             
             # Update UI
             self.record_btn.setEnabled(False)
             self.stop_btn.setEnabled(True)
+            self.pause_btn.setEnabled(True)
+            self.pause_btn.setVisible(True)
             self.device_combo.setEnabled(False)
-            # Keep mic_check enabled so user can toggle mic on/off during recording
-            # But disable mic_combo to prevent device switching mid-recording
             self.mic_combo.setEnabled(False)
             self.screen_record_check.setEnabled(False)
             self.screen_combo.setEnabled(False)
@@ -520,32 +641,61 @@ class MainWindow(QMainWindow):
             self.status_label.setStyleSheet("color: #ff4444; font-size: 13px;")
             
             self.record_btn.setText("Recording...")
-            self.rec_dot.setVisible(True) # Show red dot
+            self.rec_dot.setVisible(True)
             
             # Update Tray
             self.tray_action_toggle.setText("Stop Recording")
             self._set_tray_icon_color("red")
             
-            # Show Overlay
-            # Center it on screen initially or just show
-            # self.overlay.move(100, 100) # Optional positioning
+            # Show Overlay with mic state synced
+            self.overlay.set_mic_active(self.mic_check.isChecked())
+            self.overlay.set_paused(False)
             self.overlay.show()
             self.overlay.update_time("00:00:00")
+            
+            self.toast.success("Recording started")
         else:
-            QMessageBox.warning(
-                self, "Recording Failed",
-                f"Could not start recording from {device.name}.\n"
-                "Please check the device is available."
-            )
+            self.toast.error(f"Could not start recording from {device.name}")
+    
+    def toggle_pause(self) -> None:
+        """Toggle pause/resume recording."""
+        if self._is_paused:
+            # Resume
+            self.audio_engine.resume_recording()
+            self._is_paused = False
+            if self._pause_start_time:
+                self._total_paused_seconds += (datetime.now() - self._pause_start_time).total_seconds()
+                self._pause_start_time = None
+            
+            self.pause_btn.setText("⏸ Pause")
+            self.rec_dot.setStyleSheet("color: #e11d48; font-size: 24px;")
+            self.duration_label.setStyleSheet("color: #f8fafc;")
+            self.status_label.setText("🔴 Recording resumed")
+            self.status_label.setStyleSheet("color: #ff4444; font-size: 13px;")
+            self.overlay.set_paused(False)
+            self.toast.info("Recording resumed")
+        else:
+            # Pause
+            self.audio_engine.pause_recording()
+            self._is_paused = True
+            self._pause_start_time = datetime.now()
+            
+            self.pause_btn.setText("▶ Resume")
+            self.rec_dot.setStyleSheet("color: #f59e0b; font-size: 24px;")
+            self.duration_label.setStyleSheet("color: #f59e0b;")
+            self.status_label.setText("⏸ Recording paused")
+            self.status_label.setStyleSheet("color: #f59e0b; font-size: 13px;")
+            self.overlay.set_paused(True)
+            self.toast.warning("Recording paused")
     
     def stop_recording(self) -> None:
         """Stop audio recording and save file."""
         self.duration_timer.stop()
+        self._is_paused = False
+        self._pause_start_time = None
         
-        # Stop Audio
         audio_path = self.audio_engine.stop_recording()
         
-        # Stop Video
         video_path = None
         if self.is_recording_video:
             video_path = self.video_engine.stop_recording()
@@ -553,15 +703,20 @@ class MainWindow(QMainWindow):
         # Reset UI
         self.record_btn.setEnabled(True)
         self.stop_btn.setEnabled(False)
+        self.pause_btn.setEnabled(False)
+        self.pause_btn.setVisible(False)
+        self.pause_btn.setText("⏸ Pause")
         self.device_combo.setEnabled(True)
         self.mic_check.setEnabled(True)
         self.mic_combo.setEnabled(self.mic_check.isChecked())
         self.screen_record_check.setEnabled(True)
-        self.screen_combo.setEnabled(self.screen_record_check.isChecked())
+        self.screen_combo.setEnabled(True)
         self.refresh_btn.setEnabled(True)
         
         self.record_btn.setText("Start Recording")
         self.rec_dot.setVisible(False)
+        self.rec_dot.setStyleSheet("color: #e11d48; font-size: 24px;")
+        self.duration_label.setStyleSheet("color: #f8fafc;")
         self.sys_silence_indicator.reset()
         self.mic_silence_indicator.reset()
         
@@ -574,28 +729,22 @@ class MainWindow(QMainWindow):
         
         final_path = audio_path
         
-        # Handle Merge if Video was recorded
         if self.is_recording_video and audio_path and video_path:
             self.status_label.setText("⏳ Merging Audio & Video...")
             self.status_label.setStyleSheet("color: #ebcb8b; font-size: 13px;")
-            QApplication.processEvents() # Force UI update
-            
+            QApplication.processEvents()
             final_path = self._merge_recordings(audio_path, video_path)
         
         if final_path and os.path.exists(final_path):
-            file_size = os.path.getsize(final_path) / 1024 / 1024  # MB
+            file_size = os.path.getsize(final_path) / 1024 / 1024
             self.status_label.setText(f"✅ Saved: {os.path.basename(final_path)} ({file_size:.1f} MB)")
             self.status_label.setStyleSheet("color: #00cc66; font-size: 13px;")
             
-            # Show success message with option to reveal in Finder
-            reply = QMessageBox.information(
-                self, "Recording Saved",
-                f"Recording saved to:\n{final_path}\n\nWould you like to reveal it in Finder?",
-                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
-            )
+            # Add to history
+            self.history_widget.add_recording(final_path)
             
-            if reply == QMessageBox.StandardButton.Yes:
-                os.system(f'open -R "{final_path}"')
+            # Toast instead of blocking dialog
+            self.toast.success(f"Saved: {os.path.basename(final_path)} ({file_size:.1f} MB)")
         else:
             self.status_label.setText("Ready to record")
             self.status_label.setStyleSheet("color: #888; font-size: 13px;")
@@ -604,37 +753,30 @@ class MainWindow(QMainWindow):
         """Merge audio and video files using ffmpeg."""
         try:
             output_path = video_path.replace("video_temp_", "screen_recording_")
-            
-            # FFmpeg command: merge audio and video
-            # -c:v copy: Copy video stream (no re-encoding)
-            # -c:a aac: Convert audio to AAC (good for mp4 container)
-            # -shortest: Finish when the shortest stream ends
             cmd = [
                 'ffmpeg', '-y',
                 '-i', video_path,
                 '-i', audio_path,
-                '-c:v', 'libx264',   # Re-encode with H.264
-                '-crf', '23',        # Constant Rate Factor (23 is default good quality)
-                '-preset', 'veryfast', # Fast encoding
+                '-c:v', 'libx264',
+                '-crf', '23',
+                '-preset', 'veryfast',
                 '-c:a', 'aac',
                 '-shortest',
                 '-loglevel', 'error',
                 output_path
             ]
-            
             result = subprocess.run(cmd, capture_output=True, text=True)
             
             if result.returncode == 0:
-                # Cleanup temp files
                 os.remove(audio_path)
                 os.remove(video_path)
                 return output_path
             else:
-                self._show_error(f"Merge failed: {result.stderr}")
-                return audio_path # Return at least the audio
+                self.toast.error(f"Merge failed: {result.stderr[:100]}")
+                return audio_path
                 
         except Exception as e:
-            self._show_error(f"Merge error: {e}")
+            self.toast.error(f"Merge error: {e}")
             return audio_path
     
     def change_output_directory(self) -> None:
@@ -646,23 +788,26 @@ class MainWindow(QMainWindow):
         
         if directory:
             self.output_directory = directory
-        if directory:
-            self.output_directory = directory
             self.change_output_btn.setText(f"Save to: .../{os.path.basename(directory)}")
             self.change_output_btn.setToolTip(directory)
+            # Rescan history for new directory
+            self.history_widget.scan_directory(directory)
     
     def update_duration_display(self) -> None:
         """Update the recording duration display."""
+        if self._is_paused:
+            return  # Don't update timer while paused
+            
         duration = self.audio_engine.recording_duration
         hours = int(duration // 3600)
         minutes = int((duration % 3600) // 60)
         seconds = int(duration % 60)
         
-        self.duration_label.setText(f"{hours:02d}:{minutes:02d}:{seconds:02d}")
+        time_str = f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+        self.duration_label.setText(time_str)
         
-        # Update Overlay
         if self.overlay.isVisible():
-            self.overlay.update_time(f"{hours:02d}:{minutes:02d}:{seconds:02d}")
+            self.overlay.update_time(time_str)
     
     def _on_level_update(self, sys_db: float, mic_db: float) -> None:
         """Handle level update from audio engine (thread-safe)."""
@@ -684,11 +829,18 @@ class MainWindow(QMainWindow):
         self.sys_silence_indicator.update_warning(sys_warn, sys_dur)
         self.mic_silence_indicator.update_warning(mic_warn, mic_dur)
         
+        # Update noise gate status indicator
+        if self.noise_gate_check.isChecked() and self.audio_engine.noise_gate_is_open:
+            self.gate_status_label.setText("● OPEN")
+            self.gate_status_label.setStyleSheet("color: #22c55e; font-size: 11px;")
+        elif self.noise_gate_check.isChecked():
+            self.gate_status_label.setText("● CLOSED")
+            self.gate_status_label.setStyleSheet("color: #f59e0b; font-size: 11px;")
+        
         # Auto-Stop Logic (Silence > 5 mins)
         if sys_warn and sys_dur > 300 and self.audio_engine.state == RecordingState.RECORDING:
-            print("Auto-stopping due to silence...")
             self.stop_recording()
-            QMessageBox.information(self, "Auto-Stop", "Recording stopped automatically after 5 minutes of silence.")
+            self.toast.warning("Recording stopped: 5 minutes of silence detected")
     
     def _on_error(self, message: str) -> None:
         """Handle error from audio engine (thread-safe)."""
@@ -696,12 +848,12 @@ class MainWindow(QMainWindow):
     
     @pyqtSlot(str)
     def _show_error(self, message: str) -> None:
-        """Display error message to user."""
-        QMessageBox.warning(self, "Error", message)
+        """Display error message to user via toast."""
+        self.toast.error(message)
     
     def closeEvent(self, event) -> None:
         """Handle window close."""
-        if self.audio_engine.state == RecordingState.RECORDING:
+        if self.audio_engine.state in (RecordingState.RECORDING, RecordingState.PAUSED):
             reply = QMessageBox.question(
                 self, "Recording in Progress",
                 "A recording is in progress. Stop recording and exit?",
@@ -716,7 +868,6 @@ class MainWindow(QMainWindow):
             if self.is_recording_video:
                  self.video_engine.stop_recording()
         
-        
         if self.hotkey_manager:
             self.hotkey_manager.stop()
             
@@ -724,22 +875,16 @@ class MainWindow(QMainWindow):
         event.accept()
     
     def _get_stylesheet(self) -> str:
-        """
-        Get the application stylesheet.
-        Theme: Slate Dark (shadcn/ui inspired)
-        """
-        # Palette (Tailwind Slate-ish)
-        bg_main = "#020617"      # slate-950
-        card_bg = "#0f172a"      # slate-900
-        border_col = "#1e293b"   # slate-800
-        text_primary = "#f8fafc" # slate-50
-        text_secondary = "#94a3b8" # slate-400
-        text_muted = "#64748b"   # slate-500
-        
-        primary_col = "#e11d48"  # rose-600
-        primary_hover = "#be123c" # rose-700
-        
-        accent_col = "#3b82f6"   # blue-500
+        """Get the application stylesheet."""
+        bg_main = "#020617"
+        card_bg = "#0f172a"
+        border_col = "#1e293b"
+        text_primary = "#f8fafc"
+        text_secondary = "#94a3b8"
+        text_muted = "#64748b"
+        primary_col = "#e11d48"
+        primary_hover = "#be123c"
+        accent_col = "#3b82f6"
         
         return f"""
             QMainWindow {{
@@ -799,7 +944,6 @@ class MainWindow(QMainWindow):
                 padding: 4px;
             }}
             
-            /* Buttons */
             QPushButton {{
                 background-color: {bg_main};
                 color: {text_primary};
@@ -828,6 +972,23 @@ class MainWindow(QMainWindow):
             
             QPushButton#recordBtn:hover {{
                 background-color: {primary_hover};
+            }}
+            
+            QPushButton#pauseBtn {{
+                background-color: #f59e0b;
+                border: none;
+                color: white;
+                font-weight: 600;
+                font-size: 13px;
+            }}
+            
+            QPushButton#pauseBtn:hover {{
+                background-color: #d97706;
+            }}
+            
+            QPushButton#pauseBtn:disabled {{
+                background-color: {border_col};
+                color: {text_muted};
             }}
             
             QPushButton#stopBtn {{
@@ -871,7 +1032,6 @@ class MainWindow(QMainWindow):
                 text-decoration: underline;
             }}
             
-            /* Checkboxes / Switches */
             QCheckBox {{
                 spacing: 8px;
                 color: {text_primary};
@@ -889,19 +1049,17 @@ class MainWindow(QMainWindow):
             QCheckBox::indicator:checked {{
                 background-color: {accent_col};
                 border-color: {accent_col};
-                image: none; /* Can add checkmark icon url if resources available */
             }}
              
-             /* Scrollbars */
-             QScrollBar:vertical {{
+            QScrollBar:vertical {{
                  border: none;
                  background: {bg_main};
                  width: 10px;
                  margin: 0px 0px 0px 0px;
-             }}
-             QScrollBar::handle:vertical {{
+            }}
+            QScrollBar::handle:vertical {{
                  background: {border_col};
                  min-height: 20px;
                  border-radius: 5px;
-             }}
+            }}
         """

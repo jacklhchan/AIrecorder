@@ -161,7 +161,6 @@ class SilenceIndicator(QFrame):
         self._flash_timer.stop()
         self._is_warning_active = False
         self._flash_state = False
-        self._flash_state = False
 
     def set_title(self, title: str) -> None:
         """Set the warning title text."""

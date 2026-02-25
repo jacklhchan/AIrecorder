@@ -15,6 +15,7 @@ from dataclasses import dataclass
 from enum import Enum
 
 from silence_detector import SilenceDetector
+from noise_gate import NoiseGate
 
 
 class RecordingState(Enum):
@@ -79,6 +80,19 @@ class AudioEngine:
         self._level_callback: Optional[Callable[[float, float], None]] = None
         self._silence_callback: Optional[Callable[[bool, float, bool, float], None]] = None
         self._error_callback: Optional[Callable[[str], None]] = None
+        
+        # Mic gain (1.0 = unity, 0.5 = -6dB, 2.0 = +6dB)
+        self._mic_gain: float = 1.0
+        
+        # Noise gate for mic
+        self._noise_gate = NoiseGate(
+            threshold_db=-40.0,
+            attack_ms=5.0,
+            release_ms=50.0,
+            hold_ms=100.0,
+            sample_rate=self.SAMPLE_RATE
+        )
+        self._noise_gate_enabled: bool = False
         
         # Recording info
         self._output_path: Optional[str] = None
@@ -234,14 +248,13 @@ class AudioEngine:
             )
             
             # Reset state
-            
-            # Reset state
             self._audio_frames = []
             self._selected_device_index = device_index
             self._recording_start_time = datetime.now()
             self._stop_event.clear()
             self.sys_silence_detector.reset()
             self.mic_silence_detector.reset()
+            self._noise_gate.reset()
             
             # Start recording thread
             self._state = RecordingState.RECORDING
@@ -305,6 +318,7 @@ class AudioEngine:
         """Main recording loop (runs in separate thread)."""
         while not self._stop_event.is_set():
             if self._state == RecordingState.PAUSED:
+                time.sleep(0.01)  # Avoid busy-wait when paused
                 continue
             
             try:
@@ -325,6 +339,8 @@ class AudioEngine:
                 # Initialize mic status (default to no warning if not active)
                 mic_warning = False
                 mic_duration = 0.0
+                mic_db = -100.0
+                has_mic_data = False
                 
                 # Read and mix microphone if available
                 if self._mic_stream:
@@ -334,21 +350,31 @@ class AudioEngine:
                         
                         # Handle Mono Mic -> Stereo Output
                         if self._mic_channels == 1:
-                            # Duplicate mono channel to both left and right
-                            # Shape: (CHUNK_SIZE,) -> (CHUNK_SIZE, 2) -> flatten
                             mic_array = np.column_stack((mic_array, mic_array)).flatten()
+                        
+                        # Apply noise gate if enabled
+                        if self._noise_gate_enabled:
+                            mic_array = self._noise_gate.process(mic_array.astype(np.int16)).astype(np.int32)
+                        
+                        # Apply mic gain
+                        if self._mic_gain != 1.0:
+                            mic_array = (mic_array * self._mic_gain).astype(np.int32)
                             
                         # Process Mic Silence
                         _, mic_warning, mic_duration = self.mic_silence_detector.process_chunk(
                             mic_array.astype(np.int16), self.CHUNK_SIZE
                         )
                         
+                        # Calculate mic level for meters
+                        mic_rms = self.mic_silence_detector.calculate_rms(mic_array)
+                        mic_db = self.mic_silence_detector.rms_to_db(mic_rms)
+                        has_mic_data = True
+                        
                         # Mix audio (simple addition)
                         if len(mic_array) == len(mixed_array):
                             mixed_array = mixed_array + mic_array
                             
                     except Exception:
-                        # If mic fails, ignore it for this chunk
                         pass
                 
                 # Clip to 16-bit range for saving
@@ -357,17 +383,9 @@ class AudioEngine:
                 # Store mixed audio
                 self._audio_frames.append(final_audio.tobytes())
                 
-                # Calculate levels for meters
-        
-                # System Level
+                # Calculate system level
                 sys_rms = self.sys_silence_detector.calculate_rms(sys_array)
                 sys_db = self.sys_silence_detector.rms_to_db(sys_rms)
-                
-                # Mic Level
-                mic_db = -100.0
-                if self._mic_stream and 'mic_array' in locals():
-                     mic_rms = self.mic_silence_detector.calculate_rms(mic_array)
-                     mic_db = self.mic_silence_detector.rms_to_db(mic_rms)
                 
                 # Notify callbacks
                 if self._level_callback:
@@ -476,6 +494,43 @@ class AudioEngine:
             except Exception:
                 pass
             self._mic_stream = None
+    
+    @property
+    def mic_gain(self) -> float:
+        """Get mic gain multiplier."""
+        return self._mic_gain
+    
+    @mic_gain.setter
+    def mic_gain(self, value: float) -> None:
+        """Set mic gain (0.0 to 3.0)."""
+        self._mic_gain = max(0.0, min(3.0, value))
+    
+    @property
+    def noise_gate_enabled(self) -> bool:
+        """Get noise gate enabled state."""
+        return self._noise_gate_enabled
+    
+    @noise_gate_enabled.setter
+    def noise_gate_enabled(self, value: bool) -> None:
+        """Enable/disable noise gate."""
+        self._noise_gate_enabled = value
+        if not value:
+            self._noise_gate.reset()
+    
+    @property
+    def noise_gate_threshold(self) -> float:
+        """Get noise gate threshold in dB."""
+        return self._noise_gate.threshold_db
+    
+    @noise_gate_threshold.setter
+    def noise_gate_threshold(self, value: float) -> None:
+        """Set noise gate threshold in dB."""
+        self._noise_gate.threshold_db = value
+    
+    @property
+    def noise_gate_is_open(self) -> bool:
+        """Check if noise gate is currently open."""
+        return self._noise_gate.is_open
     
     @property
     def state(self) -> RecordingState:
