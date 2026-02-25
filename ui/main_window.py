@@ -15,7 +15,7 @@ from PyQt6.QtWidgets import (
 )
 
 import subprocess
-from PyQt6.QtCore import Qt, QTimer, pyqtSlot, pyqtSignal, QObject
+from PyQt6.QtCore import Qt, QTimer, pyqtSlot, pyqtSignal, QObject, QSettings, QByteArray
 from PyQt6.QtGui import QFont, QIcon, QAction
 
 from hotkey_manager import HotkeyManager
@@ -99,6 +99,9 @@ class MainWindow(QMainWindow):
         
         # Load recording history
         self.history_widget.scan_directory(self.output_directory)
+        
+        # Restore saved window geometry
+        self._restore_window_state()
         
     def _setup_system_tray(self) -> None:
         """Initialize the system tray icon."""
@@ -868,11 +871,38 @@ class MainWindow(QMainWindow):
             if self.is_recording_video:
                  self.video_engine.stop_recording()
         
+        # Save window state before closing
+        self._save_window_state()
+        
         if self.hotkey_manager:
             self.hotkey_manager.stop()
             
         self.audio_engine.terminate()
         event.accept()
+    
+    def _save_window_state(self) -> None:
+        """Save window geometry and state to QSettings."""
+        settings = QSettings("AIRecorder", "BlackHoleRecorder")
+        settings.setValue("geometry", self.saveGeometry())
+        settings.setValue("windowState", self.saveState())
+        settings.setValue("outputDirectory", self.output_directory)
+    
+    def _restore_window_state(self) -> None:
+        """Restore window geometry and state from QSettings."""
+        settings = QSettings("AIRecorder", "BlackHoleRecorder")
+        geometry = settings.value("geometry")
+        if geometry:
+            self.restoreGeometry(geometry)
+        
+        state = settings.value("windowState")
+        if state:
+            self.restoreState(state)
+        
+        saved_dir = settings.value("outputDirectory")
+        if saved_dir and os.path.isdir(saved_dir):
+            self.output_directory = saved_dir
+            self.change_output_btn.setText(f"Save to: .../{os.path.basename(saved_dir)}")
+            self.change_output_btn.setToolTip(saved_dir)
     
     def _get_stylesheet(self) -> str:
         """Get the application stylesheet."""

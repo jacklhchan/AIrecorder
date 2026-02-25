@@ -60,6 +60,7 @@ class AudioEngine:
         self._current_chunk: Optional[np.ndarray] = None
         self._mic_stream: Optional[pyaudio.Stream] = None
         self._mic_channels: int = 2
+        self._mic_lock = threading.Lock()  # Thread-safe mic stream access
         
         # Silence detection
         # Using -55dB threshold to match level meter's visual range (-60 to 0dB)
@@ -343,9 +344,12 @@ class AudioEngine:
                 has_mic_data = False
                 
                 # Read and mix microphone if available
-                if self._mic_stream:
+                with self._mic_lock:
+                    mic_stream = self._mic_stream
+                
+                if mic_stream:
                     try:
-                        mic_data = self._mic_stream.read(self.CHUNK_SIZE, exception_on_overflow=False)
+                        mic_data = mic_stream.read(self.CHUNK_SIZE, exception_on_overflow=False)
                         mic_array = np.frombuffer(mic_data, dtype=np.int16).astype(np.int32)
                         
                         # Handle Mono Mic -> Stereo Output
@@ -458,42 +462,44 @@ class AudioEngine:
     
     def enable_mic(self, mic_device_index: int) -> bool:
         """Enable microphone stream dynamically during recording."""
-        if self._state != RecordingState.RECORDING or not self._pyaudio:
+        if self._state not in (RecordingState.RECORDING, RecordingState.PAUSED) or not self._pyaudio:
             return False
         
-        # Already open
-        if self._mic_stream:
-            return True
-        
-        try:
-            mic_info = self._pyaudio.get_device_info_by_index(mic_device_index)
-            max_mic_channels = int(mic_info.get('maxInputChannels', 1))
-            self._mic_channels = min(2, max_mic_channels)
+        with self._mic_lock:
+            # Already open
+            if self._mic_stream:
+                return True
             
-            self._mic_stream = self._pyaudio.open(
-                format=self.FORMAT,
-                channels=self._mic_channels,
-                rate=self.SAMPLE_RATE,
-                input=True,
-                input_device_index=mic_device_index,
-                frames_per_buffer=self.CHUNK_SIZE
-            )
-            return True
-        except Exception as e:
-            if self._error_callback:
-                self._error_callback(f"Failed to open microphone: {e}")
-            self._mic_stream = None
-            return False
+            try:
+                mic_info = self._pyaudio.get_device_info_by_index(mic_device_index)
+                max_mic_channels = int(mic_info.get('maxInputChannels', 1))
+                self._mic_channels = min(2, max_mic_channels)
+                
+                self._mic_stream = self._pyaudio.open(
+                    format=self.FORMAT,
+                    channels=self._mic_channels,
+                    rate=self.SAMPLE_RATE,
+                    input=True,
+                    input_device_index=mic_device_index,
+                    frames_per_buffer=self.CHUNK_SIZE
+                )
+                return True
+            except Exception as e:
+                if self._error_callback:
+                    self._error_callback(f"Failed to open microphone: {e}")
+                self._mic_stream = None
+                return False
     
     def disable_mic(self) -> None:
         """Disable microphone stream dynamically during recording."""
-        if self._mic_stream:
-            try:
-                self._mic_stream.stop_stream()
-                self._mic_stream.close()
-            except Exception:
-                pass
-            self._mic_stream = None
+        with self._mic_lock:
+            if self._mic_stream:
+                try:
+                    self._mic_stream.stop_stream()
+                    self._mic_stream.close()
+                except Exception:
+                    pass
+                self._mic_stream = None
     
     @property
     def mic_gain(self) -> float:
