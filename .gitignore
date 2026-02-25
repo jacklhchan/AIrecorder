@@ -1,0 +1,42 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Virtual environment
+venv/
+.venv/
+env/
+
+# IDE
+.cursor/
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Audio test files
+*.wav
+*.mp3
+
+# Agent/AI config (not project code)
+.agent/
+.gemini/
+.claude/
+
+# Packaging output
+AIrecorder_windows_bundle/
+packaging/
+
+# Backups
+backups/
